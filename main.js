@@ -28,7 +28,8 @@ if (shotArg) app.disableHardwareAcceleration(); // dev screenshots: software ren
 if (!devRun && !app.requestSingleInstanceLock()) app.quit();
 // Уведомления Windows и кнопка на панели задач — от имени ярлыка «Пуск», который ставит установщик: у него этот же id
 // (build.appId в package.json). Без него Windows не показывает уведомления приложения.
-if (process.platform === 'win32' && app.isPackaged) app.setAppUserModelId('app.aura.voice');
+const APP_ID = 'app.aura.voice'; // под ним же Electron пишет автозапуск в реестр
+if (process.platform === 'win32' && app.isPackaged) app.setAppUserModelId(APP_ID);
 
 let win;
 let tray;
@@ -1037,6 +1038,24 @@ ipcMain.handle('autostart:set', (_e, on) => {
   refreshTray?.();
   return app.getLoginItemSettings({ args: ['--hidden'] }).openAtLogin;
 });
+// Автозапуск из версий до 0.28 лежит под старым именем (autostart-legacy.js): он убирается, а выбор не меняется —
+// была включена старая запись, а текущей нет, — включается текущая. Ошибки реестра запуску не мешают: в следующий раз ещё раз.
+const { RUN_KEY, APPROVED_KEY, LEGACY_NAME, parseRegValues, legacyPlan } = require('./autostart-legacy.js');
+function dropLegacyAutostart() {
+  const reg = (args) => new Promise((resolve) => execFile('reg.exe', args, { windowsHide: true, timeout: 5000 }, (err, out) => resolve(err ? null : out)));
+  return Promise.all([reg(['query', RUN_KEY]), reg(['query', APPROVED_KEY])]).then(async ([run, approved]) => {
+    if (run === null) return;
+    const plan = legacyPlan({ run: parseRegValues(run), approved: parseRegValues(approved), exePath: process.execPath, currentName: APP_ID });
+    if (!plan.removeRun) return;
+    if (plan.enableCurrent) app.setLoginItemSettings({ openAtLogin: true, args: ['--hidden'] });
+    const removed = (await reg(['delete', RUN_KEY, '/v', LEGACY_NAME, '/f'])) !== null;
+    if (removed && plan.removeApproved) await reg(['delete', APPROVED_KEY, '/v', LEGACY_NAME, '/f']);
+    if (plan.enableCurrent) {
+      refreshTray();
+      command('autostart'); // переключатель в окне и пункт в core.txt — по новому состоянию
+    }
+  }).catch(() => {});
+}
 
 /* ───── Preset files ───── */
 const presetFilter = [{ name: 'Пресет aura.txt', extensions: ['json'] }];
@@ -1486,6 +1505,7 @@ app.whenReady().then(() => {
     app.setLoginItemSettings({ openAtLogin: true, args: ['--hidden'] });
     try { fs.writeFileSync(asked, '1'); } catch {}
   }
+  if (app.isPackaged && process.platform === 'win32') dropLegacyAutostart();
     // Work from inside a game, without alt-tabbing to the window.
     globalShortcut.register(HOTKEY_POWER, () => command('power'));
     globalShortcut.register(HOTKEY_MUTE, () => command('mute'));

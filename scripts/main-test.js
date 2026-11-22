@@ -141,11 +141,21 @@ const electron = {
 // «Пати через Discord»: будто AuraCapture.exe на месте и Discord запущен — только когда случай этого просит
 const fake = { capture: false, discord: false };
 const children = [];
+// Реестр автозапуска (только случай packaged): старая запись «electron.app.Aura» на эту программу, текущей нет
+const regCalls = [];
+const regRun = packaged ? `\r\nHKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\r\n    Steam    REG_SZ    "C:\\Steam\\steam.exe" -silent\r\n    electron.app.Aura    REG_SZ    "${process.execPath}" --hidden\r\n\r\n` : '';
+const regApproved = packaged ? '\r\nHKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\Run\r\n    electron.app.Aura    REG_BINARY    020000000000000000000000\r\n\r\n' : '';
 const { EventEmitter } = require('events');
 const childProcess = {
   execFile(cmd, args, opts, cb) {
     const done = cb || opts;
     const name = path.basename(cmd).toLowerCase();
+    if (name === 'reg.exe' && args[1] && /CurrentVersion\\(Explorer\\StartupApproved\\)?Run$/.test(args[1])) {
+      regCalls.push(args.join(' '));
+      if (!packaged) return setImmediate(() => done(new Error('заглушка'), ''));
+      if (args[0] === 'query') return setImmediate(() => done(null, /StartupApproved/.test(args[1]) ? regApproved : regRun));
+      return setImmediate(() => done(null, 'The operation completed successfully.\r\n'));
+    }
     if (fake.discord && name === 'tasklist.exe') return setImmediate(() => done(null, '"Discord.exe","5100","Console","1","90 K"\r\n"Discord.exe","5200","Console","1","90 K"\r\n'));
     if (fake.discord && name === 'powershell.exe' && /Win32_Process/.test(String(args))) return setImmediate(() => done(null, JSON.stringify([{ ProcessId: 5200, ParentProcessId: 5100, Name: 'Discord.exe' }, { ProcessId: 5100, ParentProcessId: 4000, Name: 'Discord.exe' }])));
     setImmediate(() => done(new Error('заглушка'), ''));
@@ -246,6 +256,10 @@ Module._load = function (request, parent) {
     eq('id ярлыка — до окна', [calls.aumid, calls.windowAfterAumid], [['app.aura.voice'], true]);
     eq('первый запуск установленной: автозапуск включён', calls.login.slice(0, 1), [{ openAtLogin: true, args: ['--hidden'] }]);
     eq('...и запомнено во временной папке', fs.existsSync(path.join(userData, 'autostart.set')), true);
+    await until(() => regCalls.length >= 4, 2000);
+    const RUN = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run', APPROVED = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\Run';
+    eq('старая запись автозапуска убрана — и её отметка в StartupApproved', regCalls, ['query ' + RUN, 'query ' + APPROVED, `delete ${RUN} /v electron.app.Aura /f`, `delete ${APPROVED} /v electron.app.Aura /f`]);
+    eq('...а текущая включена', calls.login.slice(1), [{ openAtLogin: true, args: ['--hidden'] }]);
     const seen = {};
     const core = coreLink(seen);
     await until(() => core.online);
@@ -464,6 +478,24 @@ Module._load = function (request, parent) {
   eq('tasklist: Discord найден', listed.filter((p) => pd.isDiscord(p.name)).map((p) => p.pid), [5100, 5200, 7000]);
   const cim = pd.parseCim(JSON.stringify([{ ProcessId: 5200, ParentProcessId: 5100, Name: 'Discord.exe' }, { ProcessId: 5100, ParentProcessId: 4000, Name: 'Discord.exe' }, { ProcessId: 5300, ParentProcessId: 5100, Name: 'Discord.exe' }, { ProcessId: 7000, ParentProcessId: 6000, Name: 'DiscordPTB.exe' }]));
   eq('корень дерева Discord, обычный раньше PTB', [pd.pickDiscordRoot(cim), pd.pickDiscordRoot(cim.filter((p) => p.name !== 'Discord.exe')), pd.pickDiscordRoot(pd.parseCim('{"ProcessId":9,"ParentProcessId":1,"Name":"DiscordCanary.exe"}')), pd.pickDiscordRoot(pd.parseCim('не json'))], [5100, 7000, 9, 0]);
+
+  // старая запись автозапуска (autostart-legacy.js): что убирать, а что нет
+  eq('не установленная копия реестр автозапуска не трогает', regCalls, []);
+  const al = require(path.join(repo, 'autostart-legacy.js'));
+  const EXE = 'C:\\Users\\u\\AppData\\Local\\Programs\\aura-voice\\Aura.exe';
+  const runOut = (rows) => '\r\nHKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\r\n' + rows.map((r) => '    ' + r.join('    ')).join('\r\n') + '\r\n\r\n';
+  const plan = (rows, approvedRows) => al.legacyPlan({ run: al.parseRegValues(runOut(rows)), approved: al.parseRegValues(runOut(approvedRows || [])), exePath: EXE, currentName: 'app.aura.voice' });
+  const oldRow = ['electron.app.Aura', 'REG_SZ', `"${EXE}" --hidden`], curRow = ['app.aura.voice', 'REG_SZ', `"${EXE}" --hidden`];
+  const NOTHING = { removeRun: false, removeApproved: false, enableCurrent: false };
+  eq('reg query: имена с пробелами, пустые данные', al.parseRegValues(runOut([['Gaijin.Net Updater', 'REG_BINARY', '0300'], ['Empty', 'REG_SZ']])), { 'Gaijin.Net Updater': { type: 'REG_BINARY', data: '0300' }, Empty: { type: 'REG_SZ', data: '' } });
+  eq('обе записи: старая убирается, текущая не трогается', plan([oldRow, curRow], [['electron.app.Aura', 'REG_BINARY', '020000000000000000000000']]), { removeRun: true, removeApproved: true, enableCurrent: false });
+  eq('только старая, включена: убирается, текущая включается', plan([oldRow]), { removeRun: true, removeApproved: false, enableCurrent: true });
+  eq('только старая, выключена в диспетчере задач: убирается, автозапуск остаётся выключен', plan([oldRow], [['electron.app.Aura', 'REG_BINARY', '03000000C86EC629EBB6DC01']]), { removeRun: true, removeApproved: true, enableCurrent: false });
+  eq('старая без кавычек и другим регистром — тоже Aura', plan([['electron.app.Aura', 'REG_SZ', EXE.toLowerCase() + ' --hidden']]).removeRun, true);
+  eq('старое имя, но чужая программа — не трогается', plan([['electron.app.Aura', 'REG_SZ', '"C:\\Other\\Aura.exe" --hidden']]), NOTHING);
+  eq('Aura.exe под чужим именем — не трогается', plan([['Aura', 'REG_SZ', `"${EXE}"`], curRow]), NOTHING);
+  eq('старой нет — ничего', [plan([curRow]), plan([])], [NOTHING, NOTHING]);
+  eq('отметка без записи в Run — не трогается', plan([curRow], [['electron.app.Aura', 'REG_BINARY', '02']]), NOTHING);
 
   // дорога к core.txt
   eq('core:info', info(), { online: true, installed: true, quitHere: true });

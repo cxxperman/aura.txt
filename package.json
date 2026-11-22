@@ -27,6 +27,7 @@
       "preload.js",
       "hub-client.js",
       "family.js",
+      "autostart-legacy.js",
       "ai-convert.js",
       "ai-worker.js",
       "party-mix.js",
